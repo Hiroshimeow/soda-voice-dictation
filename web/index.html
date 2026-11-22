@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SODA Voice Dictation</title>
+<style>
+:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#f1f5fb;color:#17263d;font:16px system-ui}main{max-width:860px;margin:24px auto;padding:24px;background:white;border-radius:18px;box-shadow:0 8px 25px #152a4317}h1{font-size:26px;margin:0 0 8px}.sub{color:#58677d;line-height:1.5;margin:0 0 18px}.controls{display:flex;gap:9px;flex-wrap:wrap;margin:14px 0}button,select{font:inherit;padding:12px 16px;border-radius:10px;background:white;border:1px solid #b8c5d8;cursor:pointer;min-height:46px}button:disabled{opacity:.5;cursor:default}#start{background:#176be1;color:#fff;border:0}#state{padding:12px;background:#edf3fd;border-radius:9px;margin:16px 0 8px;line-height:1.5}#text{min-height:230px;border:1px solid #dbe2ed;border-radius:12px;padding:18px;font-size:23px;white-space:pre-wrap;line-height:1.55;overflow-wrap:anywhere}#pending{color:#637087}small{display:block;color:#58677d;margin:12px 0;line-height:1.5}.feedback{border-top:1px solid #e3e8f1;margin-top:18px;padding-top:10px}.feedback textarea{width:100%;min-height:96px;font:16px system-ui;border:1px solid #b8c5d8;border-radius:10px;padding:12px}.feedback label{display:flex;align-items:flex-start;gap:8px;margin:12px 0;line-height:1.5}.feedback input{width:20px;height:20px;flex-shrink:0}meter{width:150px;vertical-align:middle}#timer{font-variant-numeric:tabular-nums}#capture_note{color:#704e0c}@media(max-width:600px){main{margin:0;min-height:100vh;border-radius:0;padding:18px}h1{font-size:24px}#text{font-size:21px;min-height:240px}.controls button{flex:1 0 auto}}
+</style>
+</head>
+<body><main>
+<h1>Voice Dictation</h1>
+<p class="sub">Local Google Chrome SODA speech recognition. Audio stays on the host running this server; no Google Cloud fallback.</p>
+<div class="controls">
+<select id="lang" aria-label="Language"><option value="vi-VN">Vietnamese</option><option value="ja-JP">Japanese</option><option value="en-US">English (US)</option></select>
+<button id="start">Start speaking</button><button id="stop" disabled>Stop</button>
+<button id="clear">Clear</button><button id="copy">Copy</button>
+</div>
+<div id="state" role="status">Not connected.</div>
+<small><meter id="level" min="0" max="1" value="0" aria-label="Microphone level"></meter> <span id="timer">00:00</span> - <span id="connection">Checking connection...</span></small>
+<div id="text" aria-label="Transcript"><span id="committed"></span><span id="pending">Transcript will appear here...</span></div>
+<small id="bias_status">Checking Vietnamese personalization status...</small>
+<small>Audio is not saved by default. Live partial text appears immediately; press Stop to finalize the utterance.</small>
+<section class="feedback" id="training_section"><h2 style="font-size:20px">Save a corrected Vietnamese sample</h2>
+<p class="sub">Record up to 30 seconds in Vietnamese, stop, then correct the transcript exactly. Nothing is saved until you opt in below.</p>
+<small id="capture_note">No temporary recording yet.</small>
+<textarea id="correction" placeholder="Exact corrected transcript for the full utterance." aria-label="Corrected transcript"></textarea>
+<label><input id="consent" type="checkbox"><span>I consent to save this recording and corrected transcript locally for Vietnamese evaluation and adaptation research.</span></label>
+<div class="controls"><button id="save_sample" disabled>Save corrected sample</button><span id="sample_count"></span></div>
+<small id="save_result" role="status" aria-live="polite"></small>
+</section>
+</main>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const MAX_RECORD_BYTES=16000*2*30;
+let phase="idle",generation=0,socket=null,context=null,worklet=null,mic=null,mute=null,stream=null,wakeLock=null;
+let done="",partial="",sessionText="",recentPCM=[],recentBytes=0,capturedBytes=0,captureOverflow=false;
+let timer=null,drainTimer=null,flushResolve=null,startedAt=0,lastError="",readyTimer=null,sessionBiasObserved=false;
+const state=s=>{$("state").textContent=s;};
+const setPhase=value=>{
+ phase=value;
+ $("start").disabled=value!=="idle";
+ $("stop").disabled=value!=="listening";
+ $("lang").disabled=value!=="idle";
+ $("save_sample").disabled=value!=="idle"||captureOverflow||recentBytes<16000;
+};
+function render(){
+ $("committed").textContent=done;
+ $("pending").textContent=partial||(!done?(phase==="listening"?"Listening...":"Transcript will appear here..."):"");
+}
+const processorCode=`class PCM16Processor extends AudioWorkletProcessor {
+ constructor(){
+  super();this.samples=[];this.sum=0;this.weight=0;this.finished=false;
+  this.port.onmessage=e=>{if(e.data==="flush"){
+   this.finished=true;
+   if(this.weight>1e-9){this.push(this.sum/this.weight);this.sum=0;this.weight=0;}
+   this.send();this.port.postMessage({type:"flushed"});
+  }};
+ }
+ push(value){value=Math.max(-1,Math.min(1,value));this.samples.push(value<0?Math.round(value*32768):Math.round(value*32767));if(this.samples.length===1600)this.send();}
+ send(){
+  if(!this.samples.length)return;
+  const data=new Int16Array(this.samples);this.samples=[];
+  this.port.postMessage({type:"pcm",buffer:data.buffer},[data.buffer]);
+ }
+ process(inputs){
+  if(this.finished)return true;
+  const x=inputs[0]?.[0];if(!x)return true;
+  const ratio=sampleRate/16000;
+  for(let i=0;i<x.length;i++){
+   let remaining=1;
+   while(remaining>1e-9){
+    const take=Math.min(remaining,ratio-this.weight);
+    this.sum+=x[i]*take;this.weight+=take;remaining-=take;
+    if(this.weight>=ratio-1e-9){this.push(this.sum/ratio);this.weight=0;this.sum=0;}
+   }
+  }
+  return true;
+ }
+}
+registerProcessor("pcm16",PCM16Processor);`;
+function recordFrame(buffer){
+ capturedBytes+=buffer.byteLength;
+ if(capturedBytes>MAX_RECORD_BYTES){
+  captureOverflow=true;recentPCM=[];recentBytes=0;
+  $("capture_note").textContent="This utterance is over 30 seconds. Transcription continues, but it cannot be saved as a labeled sample.";
+ }else if(!captureOverflow){
+  recentPCM.push(buffer.slice(0));recentBytes+=buffer.byteLength;
+  $("capture_note").textContent="Holding "+(recentBytes/32000).toFixed(1)+" seconds temporarily in this browser.";
+ }
+ const values=new Int16Array(buffer);let sum=0;
+ for(const v of values)sum+=(v/32768)**2;
+ $("level").value=Math.min(1,Math.sqrt(sum/Math.max(1,values.length))*5);
+}
+async function releaseAudio(){
+ if(timer){clearInterval(timer);timer=null;}
+ try{mic?.disconnect();}catch{}mic=null;
+ try{worklet?.disconnect();}catch{}worklet=null;
+ try{mute?.disconnect();}catch{}mute=null;
+ if(stream){for(const track of stream.getTracks())track.stop();stream=null;}
+ const old=context;context=null;
+ if(old&&old.state!=="closed"){try{await old.close();}catch{}}
+ if(wakeLock){try{await wakeLock.release();}catch{}wakeLock=null;}
+ $("level").value=0;
+}
+async function finish(message){
+ if(readyTimer){clearTimeout(readyTimer);readyTimer=null;}
+ if(drainTimer){clearTimeout(drainTimer);drainTimer=null;}
+ await releaseAudio();
+ setPhase("idle");
+ if(message)state(message);
+ if(!captureOverflow&&recentBytes>=16000){
+  $("capture_note").textContent="This "+(recentBytes/32000).toFixed(1)+" second recording is not saved yet. Correct the full transcript before saving.";
+  if(!$("correction").value.trim())$("correction").value=sessionText.trim();
+ }
+ render();
+}
+async function fail(message){
+ lastError=message;
+ const old=socket;socket=null;
+ try{old?.close();}catch{}
+ await finish(message);
+}
+async function stop(reason=""){
+ if(phase!=="listening")return;
+ setPhase("stopping");state(reason||"Finalizing the last utterance...");
+ try{mic?.disconnect();}catch{}
+ for(const track of stream?.getTracks()||[])track.stop();
+ if(worklet&&context?.state==="running"){
+  await new Promise(resolve=>{
+   const timeout=setTimeout(()=>{flushResolve=null;lastError="The microphone did not flush its final buffer. Review the last words.";resolve();},1200);
+   flushResolve=()=>{clearTimeout(timeout);flushResolve=null;resolve();};
+   worklet.port.postMessage("flush");
+  });
+ }
+ if(socket?.readyState===WebSocket.OPEN){
+  socket.send("stop");
+  await releaseAudio();
+  drainTimer=setTimeout(()=>fail("The server did not finish the session. The visible transcript has been preserved."),20000);
+ }else await fail("The connection closed. The visible transcript has been preserved.");
+}
+$("start").onclick=async()=>{
+ if(phase!=="idle")return;
+ if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia){
+  state("Microphone access requires HTTPS or localhost.");return;
+ }
+ const mine=++generation;
+ setPhase("connecting");lastError="";sessionText="";partial="";
+ recentPCM=[];recentBytes=0;capturedBytes=0;captureOverflow=false;
+ $("correction").value="";$("consent").checked=false;$("capture_note").textContent="Preparing microphone...";
+ state("Opening microphone and connecting to SODA...");
+ try{
+  const AudioContextClass=window.AudioContext||window.webkitAudioContext;
+  context=new AudioContextClass();
+  await context.resume();
+  const media=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  if(mine!==generation||phase!=="connecting"){media.getTracks().forEach(t=>t.stop());return;}
+  stream=media;
+  const ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/v1/stt?lang="+encodeURIComponent($("lang").value));
+  socket=ws;
+  readyTimer=setTimeout(()=>{if(socket===ws)fail("SODA was not ready after 30 seconds. Try again.");},30000);
+  ws.onmessage=async event=>{
+   if(socket!==ws||mine!==generation)return;
+   let value;try{value=JSON.parse(event.data);}catch{await fail("The server returned invalid data.");return;}
+   if(value.type==="ready"&&phase==="connecting"){
+    sessionBiasObserved=true;
+    $("bias_status").textContent=value.bias_profile_sha256==="baseline"?"This session uses the baseline SODA model.":"This Vietnamese session uses a contextual-bias profile.";
+    clearTimeout(readyTimer);readyTimer=null;
+    try{
+     const url=URL.createObjectURL(new Blob([processorCode],{type:"text/javascript"}));
+     try{await context.audioWorklet.addModule(url);}finally{URL.revokeObjectURL(url);}
+     if(socket!==ws||mine!==generation)return;
+     mic=context.createMediaStreamSource(stream);
+     worklet=new AudioWorkletNode(context,"pcm16");
+     mute=context.createGain();mute.gain.value=0;
+     worklet.port.onmessage=e=>{
+      if(e.data.type==="flushed"){flushResolve?.();return;}
+      if(e.data.type!=="pcm"||socket!==ws||!["listening","stopping"].includes(phase))return;
+      if(ws.readyState!==WebSocket.OPEN)return;
+      if(ws.bufferedAmount>32000*5){fail("The connection cannot keep up with audio. The session was stopped.");return;}
+      ws.send(e.data.buffer);recordFrame(e.data.buffer);
+     };
+     worklet.connect(mute);mute.connect(context.destination);mic.connect(worklet);
+     await context.resume();
+     if(context.state!=="running")throw new Error("The browser suspended the microphone. Start again.");
+     setPhase("listening");startedAt=Date.now();$("timer").textContent="00:00";
+     timer=setInterval(()=>{const seconds=Math.floor((Date.now()-startedAt)/1000);$("timer").textContent=String(Math.floor(seconds/60)).padStart(2,"0")+":"+String(seconds%60).padStart(2,"0");},250);
+     for(const track of stream.getAudioTracks())track.addEventListener("ended",()=>{if(phase==="listening")stop("The microphone ended; finalizing the last utterance...");});
+     context.onstatechange=()=>{if(context&&context.state!=="running"&&phase==="listening")stop("The microphone was suspended; finalizing the session...");};
+     if(navigator.wakeLock){try{wakeLock=await navigator.wakeLock.request("screen");}catch{}}
+     state("Listening - local SODA recognition");render();
+    }catch(error){await fail("Microphone error: "+error.message);}
+   }else if(value.type==="partial"){partial=value.text;render();}
+   else if(value.type==="final"){done+=value.text+"\n";sessionText+=value.text+" ";partial="";render();}
+   else if(value.type==="error"){await fail("SODA: "+value.code+". The visible transcript has been preserved.");}
+   else if(value.type==="closed"){
+    socket=null;ws.close();await finish(lastError||"Stopped. You can start another utterance.");
+   }
+  };
+  ws.onerror=()=>{if(socket===ws)fail("Could not connect to SODA over WebSocket.");};
+  ws.onclose=()=>{if(socket===ws){socket=null;finish(lastError||"Connection closed. Review the final transcript.");}};
+ }catch(error){
+  if(mine===generation)await fail(error.name==="NotAllowedError"?"Microphone permission was denied. Allow it in site settings and try again.":"Could not open the microphone: "+error.message);
+ }
+};
+$("lang").onchange=()=>{const vi=$("lang").value==="vi-VN";$("training_section").style.display=vi?"":"none";$("bias_status").style.display=vi?"":"none";};
+$("lang").onchange();
+$("stop").onclick=()=>stop();
+$("clear").onclick=()=>{done="";partial="";render();};
+$("copy").onclick=async()=>{
+ try{await navigator.clipboard.writeText(done+partial);state("Transcript copied.");}
+ catch{state("Clipboard access failed. Select the transcript above and copy it manually.");}
+};
+document.addEventListener("visibilitychange",()=>{
+ if(document.hidden&&phase==="listening")stop("The page was hidden; stopping the microphone and finalizing...");
+});
+window.addEventListener("pagehide",()=>{
+ ++generation;for(const track of stream?.getTracks()||[])track.stop();
+ try{socket?.close();}catch{}releaseAudio();
+});
+async function datasetStatus(){
+ try{const response=await fetch("/v1/dataset/status");if(!response.ok)throw new Error();
+ const value=await response.json();$("sample_count").textContent=value.saved_samples+" Vietnamese labeled samples saved locally.";}
+ catch{$("sample_count").textContent="Could not load sample statistics.";}
+}
+$("save_sample").onclick=async()=>{
+ if(phase!=="idle"){state("Stop the microphone before saving a sample.");return;}
+ if(captureOverflow){state("Utterances over 30 seconds cannot be saved as labeled samples.");return;}
+ if(!$("consent").checked){state("Consent is required before saving this recording.");return;}
+ const reference=$("correction").value.trim();
+ if(reference.length<2||recentBytes<16000){state("An exact transcript and at least 0.5 seconds of audio are required.");return;}
+ const savedGeneration=generation;
+ $("save_sample").disabled=true;$("save_result").textContent="Saving corrected sample...";
+ const bytes=new Uint8Array(recentBytes);let pos=0;
+ for(const part of recentPCM){bytes.set(new Uint8Array(part),pos);pos+=part.byteLength;}
+ let binary="";for(let i=0;i<bytes.length;i+=16384)binary+=String.fromCharCode(...bytes.subarray(i,i+16384));
+ try{
+  const response=await fetch("/v1/dataset/ingest",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({language:"vi-VN",consent:true,reference,pcm_base64:btoa(binary)})});
+  const value=await response.json();if(!response.ok)throw new Error(value.detail||response.status);
+  if(generation===savedGeneration){
+   $("consent").checked=false;recentPCM=[];recentBytes=0;
+   $("capture_note").textContent="Sample saved locally. Temporary browser audio was cleared.";
+   state("Corrected sample saved.");$("save_result").textContent="Corrected sample saved.";
+  }else{
+   $("save_result").textContent="The previous session sample was saved. The current recording was left untouched.";
+  }
+  await datasetStatus();
+ }catch(error){
+  const message=(generation===savedGeneration?"Could not save sample: ":"Could not save the previous session sample: ")+error.message;
+  $("save_result").textContent=message;
+  if(generation===savedGeneration)state(message);
+ }finally{
+  if(generation===savedGeneration)$("save_sample").disabled=recentBytes<16000||captureOverflow||phase!=="idle";
+ }
+};
+fetch("/health").then(response=>{if(!response.ok)throw new Error();return response.json();}).then(()=>{$("connection").textContent=location.protocol==="https:"?"HTTPS":"localhost";}).catch(()=>{$("connection").textContent="Backend unavailable";});
+fetch("/v1/adaptation/status").then(response=>response.json()).then(value=>{if(!sessionBiasObserved)$("bias_status").textContent=value.enabled?"Vietnamese contextual bias: "+value.phrase_count+" phrases.":"Vietnamese contextual bias is disabled.";}).catch(()=>{if(!sessionBiasObserved)$("bias_status").textContent="Could not read personalization status.";});
+datasetStatus();
+</script>
+</body>
+</html>

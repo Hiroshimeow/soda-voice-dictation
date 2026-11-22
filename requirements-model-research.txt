@@ -1,0 +1,6 @@
+# Isolated WSL research environment only; do not install into production venv.
+tflite==2.18.0
+ai-edge-litert==2.4.0
+flatbuffers==25.12.19
+numpy==2.5.5
+marisa-trie==1.4.1
