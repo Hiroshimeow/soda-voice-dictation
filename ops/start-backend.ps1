@@ -54,6 +54,7 @@ fi
 uv pip install --python .venv-wsl/bin/python -r requirements.txt
 PYTHONPATH="$SODA_REPO" .venv-wsl/bin/python ops/download-models.py
 '@
+$bootstrap = $bootstrap -replace "`r`n", "`n"
 $bootstrap64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrap))
 $bootstrapCommand = "echo '$bootstrap64' | base64 -d | SODA_REPO='$RepoWsl' bash"
 & wsl.exe -d $Distro -- bash -lc $bootstrapCommand
@@ -78,6 +79,7 @@ Environment=PYTHONIOENCODING=utf-8
 [Install]
 WantedBy=default.target
 "@
+$service = $service -replace "`r`n", "`n"
 $service64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($service))
 $install = "mkdir -p ~/.config/systemd/user && systemctl --user disable --now google-soda-stt.service >/dev/null 2>&1 || true; echo '$service64' | base64 -d > ~/.config/systemd/user/soda-voice-dictation.service && systemctl --user daemon-reload && systemctl --user enable --now soda-voice-dictation.service"
 & wsl.exe -d $Distro -- bash -lc $install
