@@ -18,20 +18,20 @@ Hold a global hotkey, speak, watch live partial transcription, release the hotke
 - Vietnamese personal vocabulary and deterministic post-corrections.
 - Consent-based local collection of corrected Vietnamese samples.
 - Evaluation/calibration tooling with train/holdout gates and rollback.
-- Optional browser/mobile UI and optional private Tailscale Serve access.
+- Optional browser/mobile UI and optional private Tailscale TCP access by Tailscale IP.
 
 ## Windows quick start
 
 Prerequisites:
 
 - Windows 11.
-- WSL2 with Ubuntu 22.04 installed.
+- WSL2 with Debian or Ubuntu installed.
 - Internet access on first run.
 - winget is recommended so the launcher can install FFmpeg automatically.
 
 Install WSL once if needed:
 
-    wsl --install -d Ubuntu-22.04
+    wsl --install -d Debian
 
 Then clone and run:
 
@@ -39,7 +39,7 @@ Then clone and run:
     cd soda-voice-dictation
     .\run-desktop-windows.bat
 
-On first run the launcher creates Python 3.12 environments for Windows and WSL, installs dependencies, installs FFmpeg if missing, seeds the bundled Vietnamese model into the local SODA cache, downloads/caches the SODA engine plus Japanese and English language packs, installs a user-scoped WSL service pointing at the current clone path, and starts the tray app. Later launches reuse the environments and cached models.
+On first run the launcher auto-detects a usable WSL distro (Ubuntu 22.04, Debian, Ubuntu, then another non-Docker distro), creates Python 3.12 environments for Windows and WSL, installs dependencies, installs FFmpeg if missing, seeds the bundled Vietnamese model into the local SODA cache, downloads/caches the SODA engine plus Japanese and English language packs, installs a user-scoped WSL service pointing at the current clone path, and starts the tray app. Set `SODA_WSL_DISTRO` to override the detected distro. Later launches reuse the environments and cached models.
 
 ## Dictation
 
@@ -87,7 +87,7 @@ The local web UI is available at http://127.0.0.1:18765/ . For private phone acc
 
     powershell -File ops\enable-tailnet.ps1
 
-The script discovers the current Tailscale DNS name and configures HTTPS inside the tailnet. It does not enable public Funnel access. See NETWORK.md.
+The script discovers the current Tailscale IPv4 address and exposes the local backend as a tailnet-only TCP forward on port 53219 by default, for example `http://100.x.y.z:53219/`. It removes the old SODA HTTPS Serve endpoint and does not use Funnel. Direct HTTP IP access may not satisfy browser secure-context rules for microphone capture; see NETWORK.md.
 
 ## Privacy
 

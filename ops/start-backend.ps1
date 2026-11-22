@@ -1,9 +1,34 @@
 param(
     [switch]$KeepAlive,
-    [string]$Distro = $(if ($env:SODA_WSL_DISTRO) { $env:SODA_WSL_DISTRO } else { 'Ubuntu-22.04' })
+    [string]$Distro = $env:SODA_WSL_DISTRO
 )
 $ErrorActionPreference = 'Stop'
 $RepoWindows = Split-Path $PSScriptRoot -Parent
+
+function Get-AvailableDistros {
+    return @(& wsl.exe -l -q 2>$null) |
+        ForEach-Object { ($_ -replace "`0", '').Trim() } |
+        Where-Object { $_ }
+}
+
+function Resolve-Distro {
+    $available = @(Get-AvailableDistros)
+    if ($Distro) {
+        if ($available -notcontains $Distro) {
+            throw "Requested WSL distro '$Distro' is not installed. Available: $($available -join ', ')"
+        }
+        return $Distro
+    }
+    foreach ($preferred in @('Ubuntu-22.04', 'Debian', 'Ubuntu')) {
+        if ($available -contains $preferred) { return $preferred }
+    }
+    $candidate = @($available | Where-Object { $_ -notmatch '^docker-desktop(?:-data)?$' } | Select-Object -First 1)
+    if ($candidate.Count) { return $candidate[0] }
+    throw 'No usable WSL distro found. Install Debian or Ubuntu first (for example: wsl --install -d Debian).'
+}
+
+$Distro = Resolve-Distro
+if (-not $KeepAlive) { Write-Output "Using WSL distro: $Distro" }
 
 function Get-RepoWslPath {
     if ($RepoWindows -match '^([A-Za-z]):\\(.*)$') {
@@ -29,10 +54,6 @@ if ($KeepAlive) {
     }
 }
 
-$distros = @(& wsl.exe -l -q 2>$null) | ForEach-Object { ($_ -replace "`0", '').Trim() } | Where-Object { $_ }
-if ($distros -notcontains $Distro) {
-    throw "WSL distro '$Distro' is required. Install it first with: wsl --install -d $Distro"
-}
 
 $RepoWsl = Get-RepoWslPath
 
@@ -49,6 +70,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 cd "$SODA_REPO"
 if [ ! -x .venv-wsl/bin/python ]; then
+  rm -rf .venv-wsl
   uv venv --python 3.12 .venv-wsl
 fi
 uv pip install --python .venv-wsl/bin/python -r requirements.txt
