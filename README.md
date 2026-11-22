@@ -14,7 +14,7 @@ Hold a global hotkey, speak, watch live partial transcription, release the hotke
 - Final transcript copied to the clipboard and optionally auto-inserted.
 - Local file transcription: WAV, MP3, M4A, AAC, FLAC, OGG.
 - Three SODA language modes: Vietnamese (vi-VN), Japanese (ja-JP), English US (en-US).
-- Automatic first-run download/cache of the SODA engine and all three language packs.
+- Vietnamese SODA model bundled in the repository; Japanese and English packs are downloaded/cached automatically on first run.
 - Vietnamese personal vocabulary and deterministic post-corrections.
 - Consent-based local collection of corrected Vietnamese samples.
 - Evaluation/calibration tooling with train/holdout gates and rollback.
@@ -39,7 +39,7 @@ Then clone and run:
     cd soda-voice-dictation
     .\run-desktop-windows.bat
 
-On first run the launcher creates Python 3.12 environments for Windows and WSL, installs dependencies, installs FFmpeg if missing, downloads/caches the SODA engine plus Vietnamese/Japanese/English language packs, installs a user-scoped WSL service pointing at the current clone path, and starts the tray app. Later launches reuse the environments and cached models.
+On first run the launcher creates Python 3.12 environments for Windows and WSL, installs dependencies, installs FFmpeg if missing, seeds the bundled Vietnamese model into the local SODA cache, downloads/caches the SODA engine plus Japanese and English language packs, installs a user-scoped WSL service pointing at the current clone path, and starts the tray app. Later launches reuse the environments and cached models.
 
 ## Dictation
 
@@ -57,9 +57,9 @@ Partial results are intentionally not inserted directly because SODA may revise 
 
 | Mode | Locale | Download |
 | --- | --- | --- |
-| Vietnamese | vi-VN | automatic |
-| Japanese | ja-JP | automatic |
-| English (US) | en-US | automatic |
+| Vietnamese | vi-VN | bundled in this repository (v1.3071.0) |
+| Japanese | ja-JP | automatic first-run download |
+| English (US) | en-US | automatic first-run download |
 
 The desktop selector controls both microphone dictation and file transcription. Vietnamese personal vocabulary/context biasing is applied only to Vietnamese. Japanese and English use baseline SODA.
 
@@ -91,7 +91,7 @@ The script discovers the current Tailscale DNS name and configures HTTPS inside 
 
 ## Privacy
 
-Normal dictation audio is not saved. Local/private artifacts such as data/, samples/, Python environments, SODA caches/models, and recordings are ignored by Git.
+Normal dictation audio is not saved. Local/private artifacts such as data/, samples/, Python environments, runtime SODA caches, and recordings are ignored by Git. The bundled Vietnamese model under third_party/ is intentionally tracked.
 
 ## Limitations
 
@@ -105,4 +105,4 @@ Normal dictation audio is not saved. Local/private artifacts such as data/, samp
 
 Project-authored source code is licensed under the MIT License in LICENSE.
 
-Google SODA binaries, language packs, model weights, trademarks, and other third-party components are not relicensed by this repository. They are downloaded at runtime from Google's Chrome component-update infrastructure and remain subject to their respective terms.
+Project-authored code is MIT-licensed, but Google SODA binaries, language packs, model weights, trademarks, and other third-party components are not relicensed by this repository. The Vietnamese v1.3071.0 language component is bundled under `third_party/google-soda/`; the SODA engine plus Japanese/English packs are obtained from Google's Chrome component-update infrastructure. See `third_party/google-soda/THIRD_PARTY.md`.
