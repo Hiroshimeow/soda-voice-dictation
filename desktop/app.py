@@ -5,8 +5,10 @@ import base64
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -31,6 +33,9 @@ LOCAL_DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SodaDicta
 CONFIG_PATH = LOCAL_DATA / "config.json"
 HISTORY_PATH = LOCAL_DATA / "history.json"
 API_BASE = "http://127.0.0.1:18765"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BACKEND_SCRIPT = REPO_ROOT / "ops" / "start-backend.ps1"
+BACKEND_LOG = LOCAL_DATA / "backend-start.log"
 MODE_LABELS = {"toggle": "Toggle", "hold": "Hold to talk"}
 LANG_LABELS = {cfg["label"]: locale for locale, cfg in LANGUAGES.items()}
 
@@ -98,6 +103,8 @@ class App:
             self.settings["shortcut_v2"] = True
             _save_config(self.settings)
         self.bus: queue.Queue[dict] = queue.Queue(maxsize=500)
+        self.backend_ready = threading.Event()
+        self.backend_launch_lock = threading.Lock()
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
         self.root.geometry("580x500+820+120")
@@ -152,7 +159,7 @@ class App:
         self.listener = keyboard.Listener(on_press=self._key_down, on_release=self._key_up)
         self.listener.start()
         self.root.after(40, self.process_bus)
-        threading.Thread(target=self.check_backend, daemon=True).start()
+        threading.Thread(target=self.ensure_backend, daemon=True).start()
 
     def make_ui(self) -> None:
         pad = ttk.Frame(self.root, padding=14)
@@ -348,15 +355,68 @@ class App:
         self._assign_hotkey()
         self._gain_changed()
 
-    def check_backend(self) -> None:
+    def _backend_health_ok(self, timeout: float = 1.0) -> bool:
         try:
-            with urllib.request.urlopen(f"{API_BASE}/health", timeout=3) as response:
+            with urllib.request.urlopen(f"{API_BASE}/health", timeout=timeout) as response:
                 body = json.loads(response.read(4096))
-            if not body.get("ok"):
-                raise RuntimeError("backend is not ready")
-            self._post({"type": "backend", "text": "SODA: local on-device recognition ready"})
+            return bool(body.get("ok"))
         except Exception:
-            self._post({"type": "backend", "text": "SODA is offline - run run-desktop-windows.bat again"})
+            return False
+
+    def ensure_backend(self) -> None:
+        if self.closing:
+            return
+        if self._backend_health_ok():
+            self.backend_ready.set()
+            self._post({"type": "backend", "text": "SODA: local on-device recognition ready"})
+            return
+        self.backend_ready.clear()
+        if not self.backend_launch_lock.acquire(blocking=False):
+            return
+        try:
+            if self._backend_health_ok():
+                self.backend_ready.set()
+                self._post({"type": "backend", "text": "SODA: local on-device recognition ready"})
+                return
+            self._post({"type": "backend", "text": "SODA: starting local backend..."})
+            LOCAL_DATA.mkdir(parents=True, exist_ok=True)
+            powershell = (
+                Path(os.environ.get("SystemRoot", r"C:\Windows"))
+                / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+            )
+            if not powershell.is_file():
+                raise RuntimeError(f"PowerShell not found: {powershell}")
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            with BACKEND_LOG.open("ab") as log:
+                process = subprocess.Popen(
+                    [
+                        str(powershell), "-NoProfile", "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass", "-File", str(BACKEND_SCRIPT),
+                    ],
+                    cwd=str(REPO_ROOT),
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    creationflags=creationflags,
+                )
+            deadline = time.monotonic() + 90
+            while not self.closing and time.monotonic() < deadline:
+                if self._backend_health_ok(timeout=.75):
+                    self.backend_ready.set()
+                    self._post({"type": "backend", "text": "SODA: local on-device recognition ready"})
+                    return
+                code = process.poll()
+                if code is not None and code != 0:
+                    raise RuntimeError(f"backend bootstrap exited with code {code}")
+                time.sleep(.5)
+            raise RuntimeError("backend did not become ready within 90 seconds")
+        except Exception as exc:
+            self.backend_ready.clear()
+            self._post({
+                "type": "backend",
+                "text": f"SODA backend failed: {exc}. See {BACKEND_LOG}",
+            })
+        finally:
+            self.backend_launch_lock.release()
 
     def refresh_devices(self) -> None:
         devices = ["Default"]
@@ -409,6 +469,16 @@ class App:
         if self.running or self.injecting or self.file_running:
             self.status.set("Another task is finishing; press Esc to cancel it")
             return
+        if not self.backend_ready.is_set():
+            if self._backend_health_ok(timeout=.25):
+                self.backend_ready.set()
+            else:
+                self.status.set("Starting the local SODA backend; try again when it is ready")
+                if from_hotkey and hasattr(self, "overlay"):
+                    self.overlay.show(self.hotkey_var.get())
+                    self.overlay.finish(False, "Starting SODA...")
+                threading.Thread(target=self.ensure_backend, daemon=True).start()
+                return
         self.generation += 1
         generation = self.generation
         self.saving_generation = None
