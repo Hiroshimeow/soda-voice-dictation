@@ -20,6 +20,30 @@ from desktop.windows import dictation_text, insert_after_release
 from tests.test_desktop import FakeMic
 
 
+class BackendIdentityTests(unittest.TestCase):
+    def test_health_requires_matching_checkout_identity(self):
+        from desktop.app import App
+        app = App.__new__(App)
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps({"ok": True, "checkout_id": "other"}).encode()
+        with patch("desktop.app._checkout_identity", return_value="expected"), \
+             patch("desktop.app.urllib.request.urlopen", return_value=response):
+            self.assertFalse(app._backend_health_ok())
+
+    def test_health_accepts_matching_checkout_identity(self):
+        from desktop.app import App
+        app = App.__new__(App)
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps({"ok": True, "checkout_id": "expected"}).encode()
+        with patch("desktop.app._checkout_identity", return_value="expected"), \
+             patch("desktop.app.urllib.request.urlopen", return_value=response):
+            self.assertTrue(app._backend_health_ok())
+
+
 class GainAndInsertionTests(unittest.TestCase):
     def test_zero_gain_is_exact_and_clipping_is_detected(self):
         pcm = array("h", [0, 20, -20, 32000, -32000]).tobytes()

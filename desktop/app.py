@@ -22,7 +22,7 @@ import sounddevice as sd
 
 from desktop.audio import validate_gain
 from desktop.overlay import ListeningOverlay
-from training.personal_vocabulary import (load_vocabulary, save_vocabulary, apply_replacements)
+from training.personal_vocabulary import load_vocabulary, save_vocabulary
 from desktop.core import DictationSession
 from desktop.file_transcribe import SUPPORTED_EXTENSIONS, transcribe_file
 from desktop.windows import focused_target, insert_after_release, window_process_id
@@ -38,6 +38,19 @@ BACKEND_SCRIPT = REPO_ROOT / "ops" / "start-backend.ps1"
 BACKEND_LOG = LOCAL_DATA / "backend-start.log"
 MODE_LABELS = {"toggle": "Toggle", "hold": "Hold to talk"}
 LANG_LABELS = {cfg["label"]: locale for locale, cfg in LANGUAGES.items()}
+
+
+def _checkout_identity() -> str | None:
+    """Return the source identity expected from the local backend.
+
+    A release checkout must fail closed when the identity helper cannot be
+    loaded: a healthy service from another checkout is not safe to use.
+    """
+    try:
+        from ops.checkout_identity import checkout_identity
+        return checkout_identity(REPO_ROOT)
+    except Exception:
+        return None
 
 
 def _config() -> dict:
@@ -344,7 +357,11 @@ class App:
         return LANG_LABELS.get(self.language_var.get(), DEFAULT_LANGUAGE)
 
     def _ws_url(self, locale: str | None = None) -> str:
-        return f"ws://127.0.0.1:18765/v1/stt?lang={locale or self._locale()}"
+        selected = locale or self._locale()
+        # Request Vietnamese server enhancement exactly once. Other locales
+        # retain the existing raw SODA protocol behavior.
+        suffix = "&postprocess=1&itn=safe" if selected == "vi-VN" else ""
+        return f"ws://127.0.0.1:18765/v1/stt?lang={selected}{suffix}"
 
     def _update_settings(self) -> None:
         self.settings.update({"mode": self._mode(),
@@ -356,10 +373,13 @@ class App:
         self._gain_changed()
 
     def _backend_health_ok(self, timeout: float = 1.0) -> bool:
+        expected_id = _checkout_identity()
+        if not expected_id:
+            return False
         try:
             with urllib.request.urlopen(f"{API_BASE}/health", timeout=timeout) as response:
                 body = json.loads(response.read(4096))
-            return bool(body.get("ok"))
+            return bool(body.get("ok")) and body.get("checkout_id") == expected_id
         except Exception:
             return False
 
@@ -501,7 +521,12 @@ class App:
         self.session = DictationSession(
             on_event=lambda event: self._post({**event, "generation": generation}),
             url=self._ws_url(self.active_locale),
-            device=self.devices.get(self.device_var.get()), gain_db=self._read_gain())
+            device=self.devices.get(self.device_var.get()), gain_db=self._read_gain(),
+            enhance_audio=self.active_locale == "vi-VN",
+            # Readiness is only a startup optimization.  DictationSession
+            # rechecks identity before opening the socket and before every PCM
+            # send, so a backend swap fails closed without insertion.
+            backend_health_check=lambda: self._backend_health_ok(timeout=.75))
         session = self.session
         self.worker = threading.Thread(target=lambda: __import__("asyncio").run(session.run()), daemon=True)
         self.worker.start()
@@ -551,13 +576,9 @@ class App:
         if hasattr(self, "overlay") and self.overlay.visible:
             self.overlay.processing()
         self.result_text = event.get("preview") or ""
+        # The server owns postprocessing per final. Desktop must not apply a
+        # vocabulary a second time or rewrite across final boundaries.
         text = event.get("text") or ""
-        try:
-            if getattr(self, "active_locale", DEFAULT_LANGUAGE) == "vi-VN":
-                text = apply_replacements(text, load_vocabulary())
-        except (ValueError, OSError) as error:
-            self.status.set(f"Vocabulary error: {error}")
-            text = ""  # Fail closed, not a silent unreviewed edit.
         self.last_pcm = event.get("pcm")
         if not event.get("error") and not event["cancelled"] and text:
             self.result_text = text
@@ -568,6 +589,14 @@ class App:
             self.status.set("Cancelled - text was not inserted")
             if hasattr(self, "overlay") and self.overlay.visible:
                 self.overlay.finish(False, "Cancelled")
+            return
+        if event.get("postprocess_status") == "failed":
+            # A failed enhancement is a reviewable raw result, not a normal
+            # completion.  Do not insert it or overwrite the warning below.
+            warning = "Warning: Vietnamese enhancement failed; raw transcript retained for review"
+            self.status.set(warning)
+            if hasattr(self, "overlay") and self.overlay.visible:
+                self.overlay.finish(False, "Enhancement failed - raw transcript retained")
             return
         if event.get("error"):
             self.last_pcm = None
@@ -655,18 +684,17 @@ class App:
                     self.start_btn.configure(state="normal")
                     self.level_value.set(0)
                     self.level_var.set("Microphone is off")
+                    # Final text is already server-processed; preserve it
+                    # exactly and concatenate only completed final events.
                     text=ev.get("text") or ""
-                    try:
-                        if ev.get("locale") == "vi-VN":
-                            text=apply_replacements(text,load_vocabulary())
-                    except (ValueError,OSError) as error:
-                        self.status.set(f"Vocabulary error: {error}")
-                        text=""
                     if text:
                         self.result_text=text
                         self._set_text(text)
                         self._remember_transcript(text)
-                        self.status.set(f"File transcribed - {ev.get('name','audio')} - copied to clipboard")
+                        if ev.get("postprocess_status") == "failed":
+                            self.status.set(f"Warning: enhancement failed; raw file transcript retained - {ev.get('name','audio')}")
+                        else:
+                            self.status.set(f"File transcribed - {ev.get('name','audio')} - copied to clipboard")
                     else:
                         self.status.set("No speech was recognized in the file")
                 elif kind == "file_error":
@@ -721,8 +749,19 @@ class App:
         import asyncio
         name=Path(path).name
         try:
-            result=asyncio.run(transcribe_file(path,self._ws_url(locale),lambda ev:self._post(ev)))
-            self._post({"type":"file_complete","text":result["text"],"name":name,"locale":locale})
+            # A cached readiness event is not an identity proof.  Check again
+            # in this worker immediately before ffmpeg/WebSocket transcription
+            # begins; failure leaves the file result empty and uninsertable.
+            if not self._backend_health_ok(timeout=.75):
+                raise RuntimeError(
+                    "SODA backend identity check failed; file transcription was not started"
+                )
+            result=asyncio.run(transcribe_file(path,self._ws_url(locale),lambda ev:self._post(ev),
+                                               enhance_audio=locale == "vi-VN",
+                                               backend_health_check=lambda: self._backend_health_ok(timeout=.75)))
+            self._post({"type":"file_complete","text":result["text"],"name":name,
+                        "locale":locale, "postprocess_applied":result.get("postprocess_applied", False),
+                        "postprocess_status":result.get("postprocess_status", "unchanged")})
         except Exception as exc:
             self._post({"type":"file_error","text":str(exc)[:300]})
 

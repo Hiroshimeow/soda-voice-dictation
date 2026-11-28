@@ -1,4 +1,8 @@
-"""Prepare SODA engine and supported language packs for the local backend."""
+"""Prepare the SODA engine and all configured language packs for the backend.
+
+The repository copy of the Vietnamese pack is optional: when it is absent,
+``ensure_language_pack("vi-VN")`` downloads it just like every other pack.
+"""
 from __future__ import annotations
 
 import os
@@ -20,7 +24,12 @@ def _cache_root() -> Path:
 
 
 def seed_bundled_vietnamese() -> Path | None:
-    """Seed the normal soda-stt cache from the Vietnamese pack shipped in this repo."""
+    """Optionally seed the cache from the source checkout's Vietnamese pack.
+
+    Returning ``None`` is intentional.  The caller always invokes
+    ``ensure_language_pack`` for every configured locale, so a lightweight
+    checkout without model payloads still downloads Vietnamese on first run.
+    """
     if not (BUNDLED_VI / "SODAModels").is_dir():
         return None
 

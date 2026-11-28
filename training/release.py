@@ -6,10 +6,66 @@ used for calibration so recorded artifact paths can be reverified.
 from __future__ import annotations
 import argparse,hashlib,json,math,pathlib,uuid
 from datetime import datetime,timezone
-from training.context_profile import DATA,PROFILE_PATH,ACTIVE_PATH,validate_profile,write_atomic,load_profile,profile_sha256
+from training.context_profile import (DATA, PROFILE_PATH, ACTIVE_PATH, validate_profile,
+    write_atomic, load_profile, profile_sha256, profile_digest_matches)
 from training.calibrate import read_dataset,dataset_identity,file_sha,EVALUATION_PACE,BOOST_SCALES,MIN_SAMPLES
 from training.storage import exclusive_lock
-from training.personal_vocabulary import vocabulary_fingerprint
+from training.personal_vocabulary import vocabulary_fingerprint, load_vocabulary, build_effective_profile
+
+
+def stored_profile_sha256(profile: dict | None) -> str:
+    """Hash exactly what is stored, including terms filtered from serving."""
+    if profile is None:
+        return "baseline"
+    return hashlib.sha256(json.dumps(
+        profile, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+
+def _artifact_sha256(artifact: dict) -> str:
+    payload = {key: value for key, value in artifact.items() if key != "artifact_sha256"}
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+
+def _checked_rollback_artifact(raw: dict) -> dict | None:
+    if raw.get("schema_version") == 3 and "artifact_sha256" in raw:
+        if raw.get("artifact_sha256") != _artifact_sha256(raw):
+            raise RuntimeError("Rollback artifact digest mismatch")
+        profile = validate_profile(raw["profile"]) if raw.get("profile") is not None else None
+        effective = profile_sha256(profile)
+        stored = stored_profile_sha256(profile)
+        if raw.get("profile_sha256") != effective or raw.get("stored_profile_sha256") != stored:
+            raise RuntimeError("Rollback artifact digest mismatch")
+        if profile is None:
+            if effective != "baseline" or stored != "baseline":
+                raise RuntimeError("Rollback baseline mismatch")
+            return None
+        # A storage-valid profile may contain only terms excluded at the native
+        # boundary (for example WSL2). Its effective profile is then the
+        # authenticated baseline even though the stored payload is non-empty.
+        # The artifact and both payload digests above authenticate the complete
+        # stored profile before accepting this rollback; do not reject it merely
+        # because serving currently has no native-safe terms.
+        return profile
+    if raw.get("schema_version") == 2 and "profile" in raw:
+        profile = validate_profile(raw["profile"]) if raw["profile"] is not None else None
+        expected = raw.get("profile_sha256")
+        if profile is None:
+            if expected != "baseline":
+                raise RuntimeError("Rollback baseline mismatch")
+        else:
+            legacy_match = expected == hashlib.sha256(json.dumps(
+                raw["profile"], sort_keys=True, ensure_ascii=False
+            ).encode("utf-8")).hexdigest()
+            if not profile_digest_matches(profile, expected) and not legacy_match:
+                raise RuntimeError("Rollback artifact digest mismatch")
+            if expected == "baseline":
+                raise RuntimeError("Rollback baseline mismatch")
+        return profile
+    return validate_profile(raw)
+
 
 def verify_report(report,proposal_path,active_path):
     raw=proposal_path.read_bytes();profile=validate_profile(json.loads(raw))
@@ -18,7 +74,8 @@ def verify_report(report,proposal_path,active_path):
     if report.get("candidate_sha256")!=hashlib.sha256(raw).hexdigest():raise RuntimeError("Candidate changed after evaluation")
     if report.get("train_samples",0)<15 or report.get("holdout_samples",0)<5 or report.get("train_samples",0)+report.get("holdout_samples",0)<MIN_SAMPLES:raise RuntimeError("Insufficient supervised evaluation")
     if report.get("evaluation_pace")!=EVALUATION_PACE:raise RuntimeError("Unsafe or unknown evaluation pacing")
-    if report.get("active_profile_sha256")!=profile_sha256(load_profile(active_path)):raise RuntimeError("Active profile changed after evaluation")
+    if not profile_digest_matches(load_profile(active_path), report.get("active_profile_sha256")):
+        raise RuntimeError("Active profile changed after evaluation")
     if report.get("personal_vocabulary_sha256")!=vocabulary_fingerprint():raise RuntimeError("Personal vocabulary changed or was not evaluated; rerun calibration")
     manifest=pathlib.Path(report["dataset_path"])
     rows=read_dataset(manifest)
@@ -39,17 +96,26 @@ def verify_report(report,proposal_path,active_path):
             if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<0:
                 raise RuntimeError("Invalid holdout metric")
     if not(after["wer"]<before["wer"] and after["cer"]<=before["cer"]):raise RuntimeError("Holdout regression gate not passed")
-    return validate_profile({"schema_version":1,"language":"vi-VN","terms":[{"phrase":x["phrase"],"boost":min(3.5,round(x["boost"]*scale,2))} for x in profile["terms"]]})
+    updated = validate_profile({"schema_version":1,"language":"vi-VN","terms":[{"phrase":x["phrase"],"boost":min(3.5,round(x["boost"]*scale,2))} for x in profile["terms"]]})
+    effective = build_effective_profile(load_vocabulary(), curated_profile=updated)
+    expected_effective = report.get("effective_profile_sha256")
+    if not isinstance(expected_effective, str) or profile_sha256(effective) != expected_effective:
+        raise RuntimeError("Scored effective profile does not match serving profile")
+    return updated
 
 def promote(report_path:pathlib.Path,proposal_path:pathlib.Path,*,data_dir:pathlib.Path=DATA):
     active=data_dir/"active_bias.json"
     with exclusive_lock(data_dir):
         report=json.loads(report_path.read_text(encoding="utf-8"))
         updated=verify_report(report,proposal_path,active)
-        version=profile_sha256(updated);previous=load_profile(active)
+        version=stored_profile_sha256(updated);previous=load_profile(active)
         versions=data_dir/"profile_versions"
         write_atomic(versions/(version+".json"),updated)
-        write_atomic(data_dir/"active_bias.previous.json",{"schema_version":2,"profile":previous,"profile_sha256":profile_sha256(previous)})
+        previous_artifact={"schema_version":3,"profile":previous,
+                           "profile_sha256":profile_sha256(previous),
+                           "stored_profile_sha256":stored_profile_sha256(previous)}
+        previous_artifact["artifact_sha256"]=_artifact_sha256(previous_artifact)
+        write_atomic(data_dir/"active_bias.previous.json",previous_artifact)
         write_atomic(active,updated)
         receipt={"promoted":True,"version":version,"previous_version":profile_sha256(previous),"report_sha256":file_sha(report_path),"dataset_sha256":report["dataset_sha256"],"created_at":datetime.now(timezone.utc).isoformat(),"restart_required":False,"applies_from":"next_recognition_session","weights_updated":False}
         write_atomic(versions/(version+".receipt."+uuid.uuid4().hex[:8]+".json"),receipt)
@@ -61,10 +127,7 @@ def rollback(*,data_dir:pathlib.Path=DATA):
         marker=data_dir/"active_bias.previous.baseline"
         if previous_path.exists():
             raw=json.loads(previous_path.read_text(encoding="utf-8"))
-            if raw.get("schema_version")==2 and "profile" in raw:
-                previous=validate_profile(raw["profile"]) if raw["profile"] is not None else None
-                if profile_sha256(previous)!=raw.get("profile_sha256"):raise RuntimeError("Rollback artifact digest mismatch")
-            else:previous=validate_profile(raw)
+            previous=_checked_rollback_artifact(raw)
             if previous is None:(data_dir/"active_bias.json").unlink(missing_ok=True)
             else:write_atomic(data_dir/"active_bias.json",previous)
         elif marker.exists():(data_dir/"active_bias.json").unlink(missing_ok=True)

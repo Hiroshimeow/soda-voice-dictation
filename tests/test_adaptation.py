@@ -1,20 +1,48 @@
 """Privacy, schema, and release-gate regression tests. No live Palace needed."""
 import io
+import importlib.util
 import json
 import sys
 import tempfile
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
-from training.context_profile import validate_profile, write_atomic
+from training.context_profile import load_profile, native_profile, validate_profile, write_atomic
 from training.dataset import save_sample, dataset_count
 from training.calibrate import normalized,rate,distance
 
 
 class Tests(unittest.TestCase):
+    def test_legacy_digit_profile_loads_and_native_subset_is_deterministic(self):
+        raw = {"schema_version": 1, "language": "vi-VN",
+               "terms": [{"phrase": "WSL2", "boost": 2.0},
+                         {"phrase": "FastAPI", "boost": 1.5}]}
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "active.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(load_profile(path)["terms"], raw["terms"])
+        self.assertEqual([term["phrase"] for term in native_profile(raw)["terms"]], ["FastAPI"])
+
+    @unittest.skipUnless(importlib.util.find_spec("fastapi"), "FastAPI runtime dependency unavailable")
+    def test_status_accepts_legacy_profile_and_reports_effective_terms(self):
+        import server
+        raw = {"schema_version": 1, "language": "vi-VN",
+               "terms": [{"phrase": "WSL2", "boost": 2.0},
+                         {"phrase": "FastAPI", "boost": 1.5}]}
+        vocabulary = {"schema_version": 1, "language": "vi-VN",
+                      "phrases": [], "replacements": []}
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "active.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            with patch.object(server, "BIAS_FILE", path), patch.object(server, "load_vocabulary", return_value=vocabulary):
+                status = server.adaptation_status()
+        self.assertEqual(status["phrase_count"], 1)
+        self.assertTrue(status["enabled"])
+
     def test_profile_rejects_secrets(self):
         base={"schema_version":1,"language":"vi-VN","terms":[{"phrase":"MCP Device","boost":2.0}]}
         self.assertEqual(len(validate_profile(base)["terms"]),1)
