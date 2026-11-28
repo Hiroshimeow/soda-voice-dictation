@@ -11,13 +11,19 @@ from typing import Callable
 import sounddevice as sd
 from websockets.asyncio.client import connect
 
-from desktop.audio import gain_pcm16, validate_gain
+from desktop.audio import (
+    AudioFrontendConfig,
+    StreamingAudioFrontend,
+    gain_pcm16,
+    validate_gain,
+)
 
 SAMPLE_RATE = 16000
 BLOCK_FRAMES = 1600
 MAX_SAMPLE_BYTES = 30 * SAMPLE_RATE * 2
 STARTUP_BUFFER_SECONDS = 4
 MAX_PENDING_FRAMES = int(STARTUP_BUFFER_SECONDS * SAMPLE_RATE / BLOCK_FRAMES)
+TRAILING_SILENCE_CHUNKS = 4  # 400 ms silence flush for SODA HAT lookahead
 
 
 @dataclass
@@ -40,7 +46,8 @@ class DictationBuffer:
 
     @property
     def preview(self) -> str:
-        return " ".join(filter(None, (*self.segments, self.pending)))
+        parts = [*self.segments, self.pending] if self.pending else self.segments
+        return " ".join(parts)
 
 
 @dataclass
@@ -74,6 +81,9 @@ class DictationSession:
         device: int | None = None,
         gain_db: float = 0,
         final_timeout: float = 45,
+        enhance_audio: bool = False,
+        frontend_config: AudioFrontendConfig | None = None,
+        backend_health_check: Callable[[], bool] | None = None,
     ):
         self.url = url
         self.microphone = microphone
@@ -81,11 +91,25 @@ class DictationSession:
         self.device = device
         self.gain_db = validate_gain(gain_db)
         self.final_timeout = final_timeout
+        self.enhance_audio = enhance_audio
+        # The desktop identity gate is deliberately checked at the send
+        # boundary, not inferred from the cached readiness event.  This also
+        # catches a backend swap while a session is already open.
+        self.backend_health_check = backend_health_check
+        self._frontend = (
+            StreamingAudioFrontend(
+                frontend_config or AudioFrontendConfig(manual_gain_db=self.gain_db)
+            )
+            if enhance_audio
+            else None
+        )
         self.stop_requested = threading.Event()
         self.cancel_requested = threading.Event()
         self.buffer = DictationBuffer()
         self.sample = AudioSample()
         self.error: str | None = None
+        self.postprocess_applied = False
+        self.postprocess_status = "unchanged"
         self._loop = None
         self._runner_task = None
 
@@ -126,7 +150,21 @@ class DictationSession:
                 self.buffer.partial(item["text"])
                 self._event("transcript", text=self.buffer.preview, final=False)
             elif kind == "final":
-                self.buffer.final(item["text"])
+                # Preserve native text if enhancement failed; it remains
+                # reviewable and must not be presented as enhanced output.
+                final_text = (item.get("raw_text", item["text"])
+                              if item.get("postprocess_status") == "failed"
+                              else item["text"])
+                self.buffer.final(final_text)
+                self.postprocess_applied = self.postprocess_applied or bool(
+                    item.get("postprocess_applied")
+                )
+                status = item.get("postprocess_status")
+                if status == "failed":
+                    self.postprocess_status = "failed"
+                    self._event("status", text="Warning: Vietnamese enhancement failed; raw transcript retained for review")
+                elif status == "applied" and self.postprocess_status != "failed":
+                    self.postprocess_status = "applied"
                 self._event("transcript", text=self.buffer.preview, final=True)
             elif kind == "error":
                 self.error = str(item.get("code", "soda_error"))
@@ -186,7 +224,10 @@ class DictationSession:
                 chunk = bytes(raw)
                 if len(chunk) != BLOCK_FRAMES * 2:
                     raise RuntimeError("Microphone returned an invalid frame size")
-                chunk, levels = gain_pcm16(chunk, self.gain_db)
+                if self._frontend is not None:
+                    chunk, levels = self._frontend.process_chunk(chunk)
+                else:
+                    chunk, levels = gain_pcm16(chunk, self.gain_db)
                 try:
                     pending.put_nowait(chunk)
                 except asyncio.QueueFull as exc:
@@ -201,7 +242,16 @@ class DictationSession:
     async def _stream_audio(self, pending: asyncio.Queue, capture_task, deadline: float) -> None:
         result_task = None
         ready = False
+        async def verify_backend() -> None:
+            if self.backend_health_check is not None:
+                healthy = await asyncio.to_thread(self.backend_health_check)
+                if not healthy:
+                    raise RuntimeError(
+                        "SODA backend identity check failed; no audio was sent"
+                    )
+
         try:
+            await verify_backend()
             async with connect(
                 self.url, open_timeout=max(.01, deadline - asyncio.get_running_loop().time()),
                 close_timeout=2, max_size=262144, ping_interval=15, ping_timeout=15,
@@ -231,6 +281,7 @@ class DictationSession:
                     if result_task.done():
                         result_task.result()
                         return
+                    await verify_backend()
                     await asyncio.wait_for(socket.send(chunk), timeout=3)
                     # Catch up retained 100 ms frames at no more than 2x.
                     # Once the queue is empty, microphone reads pace live audio.
@@ -312,4 +363,7 @@ class DictationSession:
                 error=None if cancelled else self.error,
                 pcm=None if cancelled or self.error else self.sample.get_if_eligible(),
                 sample_eligible=not self.sample.over_limit,
+                postprocess_applied=self.postprocess_applied,
+                postprocess_status=self.postprocess_status,
+                postprocess_warning=(self.postprocess_status == "failed"),
             )

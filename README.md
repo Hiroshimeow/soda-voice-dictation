@@ -14,7 +14,7 @@ Hold a global hotkey, speak, watch live partial transcription, release the hotke
 - Final transcript copied to the clipboard and optionally auto-inserted.
 - Local file transcription: WAV, MP3, M4A, AAC, FLAC, OGG.
 - Three SODA language modes: Vietnamese (vi-VN), Japanese (ja-JP), English US (en-US).
-- Vietnamese SODA model bundled in the repository; Japanese and English packs are downloaded/cached automatically on first run.
+- All configured SODA language packs are downloaded/cached automatically on first run; an optional Vietnamese pack in a full source checkout can seed the cache faster.
 - Vietnamese personal vocabulary and deterministic post-corrections.
 - Consent-based local collection of corrected Vietnamese samples.
 - Evaluation/calibration tooling with train/holdout gates and rollback.
@@ -39,7 +39,20 @@ Then clone and run:
     cd soda-voice-dictation
     .\run-desktop-windows.bat
 
-On first run the launcher auto-detects a usable WSL distro (Ubuntu 22.04, Debian, Ubuntu, then another non-Docker distro), creates Python 3.12 environments for Windows and WSL, installs dependencies, installs FFmpeg if missing, seeds the bundled Vietnamese model into the local SODA cache, downloads/caches the SODA engine plus Japanese and English language packs, installs a user-scoped WSL service pointing at the current clone path, and starts the tray app. Set `SODA_WSL_DISTRO` to override the detected distro. Later launches reuse the environments and cached models.
+On first run the launcher auto-detects a usable WSL distro (Ubuntu 22.04, Debian, Ubuntu, then another non-Docker distro), creates Python 3.12 environments for Windows and WSL, installs dependencies, installs FFmpeg if missing, resolves the SODA engine and downloads/caches every configured language pack (Vietnamese, Japanese, and English), installs a user-scoped WSL service pointing at the current clone path, and starts the tray app. A full source checkout may seed Vietnamese from `third_party/` before that download; this is only an optimization and is not required. Set `SODA_WSL_DISTRO` to override the detected distro. Later launches reuse the environments and cached models.
+
+## Test-suite split
+
+The project intentionally keeps the Windows desktop environment separate from
+the WSL native-handler environment; `requirements-desktop.txt` does not need
+FastAPI. Run the platform-specific suites in their owning environments:
+
+- Windows project venv: `.venv-desktop\\Scripts\\python.exe -m unittest discover -s tests -p "test_desktop*.py"`
+- WSL handler/terminal regression: `.venv-wsl/bin/python -m unittest tests.test_server_terminal`
+- WSL profile/EOF integration (requires the native model setup): `.venv-wsl/bin/python tests/test_profile_reload.py`
+
+`tests/test_server_terminal.py` is dependency-light and remains runnable
+directly in WSL, while Windows-only tests self-skip outside Windows.
 
 ## Dictation
 
@@ -57,7 +70,7 @@ Partial results are intentionally not inserted directly because SODA may revise 
 
 | Mode | Locale | Download |
 | --- | --- | --- |
-| Vietnamese | vi-VN | bundled in this repository (v1.3071.0) |
+| Vietnamese | vi-VN | automatic first-run download (optional source-checkout seed: v1.3071.0) |
 | Japanese | ja-JP | automatic first-run download |
 | English (US) | en-US | automatic first-run download |
 
@@ -91,7 +104,7 @@ The script discovers the current Tailscale IPv4 address and exposes the local ba
 
 ## Privacy
 
-Normal dictation audio is not saved. Local/private artifacts such as data/, samples/, Python environments, runtime SODA caches, and recordings are ignored by Git. The bundled Vietnamese model under third_party/ is intentionally tracked.
+Normal dictation audio is not saved. Local/private artifacts such as data/, samples/, Python environments, runtime SODA caches, and recordings are ignored by Git. Full source checkouts may contain a tracked Vietnamese model for optional cache seeding; lightweight transfer ZIPs deliberately exclude all SODA model payloads.
 
 ## Limitations
 
@@ -105,4 +118,4 @@ Normal dictation audio is not saved. Local/private artifacts such as data/, samp
 
 Project-authored source code is licensed under the MIT License in LICENSE.
 
-Project-authored code is MIT-licensed, but Google SODA binaries, language packs, model weights, trademarks, and other third-party components are not relicensed by this repository. The Vietnamese v1.3071.0 language component is bundled under `third_party/google-soda/`; the SODA engine plus Japanese/English packs are obtained from Google's Chrome component-update infrastructure. See `third_party/google-soda/THIRD_PARTY.md`.
+Project-authored code is MIT-licensed, but Google SODA binaries, language packs, model weights, trademarks, and other third-party components are not relicensed by this repository. Fresh checkouts and lightweight transfer ZIPs obtain the SODA engine and all configured language packs from Google's Chrome component-update infrastructure on first run. The full source checkout may also contain the Vietnamese v1.3071.0 component under `third_party/google-soda/` as an optional seed; `ops/create-portable-zip.ps1` excludes its `SODAModels` payload and redistributes no model binaries. See `third_party/google-soda/THIRD_PARTY.md`.

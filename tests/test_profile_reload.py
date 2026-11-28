@@ -94,8 +94,16 @@ async def exercise(base, profile_path):
     code, invalid = await asyncio.to_thread(status, base)
     assert (code, invalid) == (503, {"detail": "invalid_bias_profile"})
     async with websockets.connect(url) as ws:
-        error = json.loads(await asyncio.wait_for(ws.recv(), 10))
-        assert error == {"type": "error", "code": "invalid_bias_profile"}, error
+        await ws.send("stop")
+        events = []
+        async for raw in ws:
+            events.append(json.loads(raw))
+            if events[-1]["type"] == "closed":
+                break
+        assert events == [
+            {"type": "error", "code": "invalid_bias_profile"},
+            {"type": "closed"},
+        ], events
     profile_path.unlink()
     await finish(await session(url, "baseline"))
     print("INVALID_PROFILE refused; baseline recovered", flush=True)
@@ -107,7 +115,8 @@ def main():
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-        env = {**os.environ, "STT_BIAS_PROFILE": str(folder / "active.json")}
+        env = {**os.environ, "STT_BIAS_PROFILE": str(folder / "active.json"),
+               "STT_VOCABULARY_PATH": str(folder / "vocabulary.json")}
         with (folder / "server.log").open("w") as log:
             process = subprocess.Popen(
                 [sys.executable, "-m", "uvicorn", "server:app", "--host",

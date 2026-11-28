@@ -2,6 +2,9 @@
 from __future__ import annotations
 import multiprocessing, os, queue, signal, tempfile, time
 
+from native_session import _native_stream_status
+
+
 def _worker(recognizer, pcm, pace, result_queue, session_temp):
     if os.name == "posix":
         os.setsid()
@@ -15,7 +18,12 @@ def _worker(recognizer, pcm, pace, result_queue, session_temp):
         first = None
         finals = []
         partials = 0
-        for event in recognizer.stream_pcm(
+        # Use the same narrow adapter boundary as serving.  It accepts an
+        # explicit stream_pcm_status protocol when available and otherwise
+        # checks the installed adapter's owned helper process/frames without
+        # changing site-packages.
+        for event in _native_stream_status(
+            recognizer,
             (pcm[i:i + 3200] for i in range(0, len(pcm), 3200)),
             realtime_factor=pace,
         ):
@@ -27,6 +35,7 @@ def _worker(recognizer, pcm, pace, result_queue, session_temp):
                 partials += 1
         result_queue.put({
             "ok": True, "text": " ".join(finals).strip(),
+            "finals": finals,
             "first_result_seconds": first, "elapsed_seconds": time.monotonic() - start,
             "final_segments": len(finals), "partial_events": partials,
         })
@@ -84,9 +93,12 @@ def recognize_pcm(recognizer, pcm: bytes, *, pace: float = 2, timeout: float | N
             if process.is_alive():
                 raise RuntimeError("Decode worker did not exit after delivering result")
             if not result["ok"]:
+                # Never turn a helper failure into ``text=""``.  Keep the
+                # structured failure available to callers that want to skip a
+                # sample, while the historical API still raises explicitly.
                 raise RuntimeError(result["error_type"] + ": " + result["error"])
-            if not result["text"].strip():
-                raise RuntimeError("Native decode returned no final text")
+            # Empty native output is a valid measured no-final outcome only
+            # when the worker completed successfully.
             return result
         finally:
             _stop(process)

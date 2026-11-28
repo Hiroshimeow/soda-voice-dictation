@@ -8,7 +8,7 @@ import argparse, hashlib, json, pathlib, re, time, unicodedata, wave
 from datetime import datetime, timezone
 from training.context_profile import DATA, PROFILE_PATH, ACTIVE_PATH,validate_profile,apply_to_soda,write_atomic,load_profile,profile_sha256
 from training.storage import stable_split
-from training.personal_vocabulary import load_vocabulary, to_soda_profile, merge_profile, vocabulary_fingerprint
+from training.personal_vocabulary import load_vocabulary, build_effective_profile, vocabulary_fingerprint
 DATASET=DATA/"eval_manifest.jsonl"
 AUDIO_DIR=DATA/"audio"
 REPORT=DATA/"calibration_report.json"
@@ -69,10 +69,15 @@ def load_dataset(path:pathlib.Path):
     train=[r[:3] for r in rows if r[3]=="train"];holdout=[r[:3] for r in rows if r[3]=="holdout"]
     if len(train)<15 or len(holdout)<5:raise ValueError(f"Need >=15 train and >=5 holdout; fixed partition has {len(train)}/{len(holdout)}. Collect more corrections; do not move samples.")
     return train,holdout
-def decode(recognizer,wav_path:pathlib.Path)->str:
+def decode_structured(recognizer,wav_path:pathlib.Path)->dict:
     with wave.open(str(wav_path),"rb") as w:pcm=w.readframes(w.getnframes())
     from training.bounded_decode import recognize_pcm
-    return recognize_pcm(recognizer,pcm,pace=EVALUATION_PACE)["text"]
+    return recognize_pcm(recognizer,pcm,pace=EVALUATION_PACE)
+
+
+def decode(recognizer,wav_path:pathlib.Path)->str:
+    """Preserve the historical public string contract; no-final is ``""``."""
+    return decode_structured(recognizer, wav_path)["text"]
 def scaled_profile(candidate,scale):
     return validate_profile({"schema_version":1,"language":"vi-VN","terms":[{"phrase":x["phrase"],"boost":min(3.5,round(x["boost"]*scale,2))} for x in candidate["terms"]]})
 def make_recognizer(profile=None):
@@ -89,8 +94,10 @@ def model_identity(rec):
 def score(samples,profile):
     rec=make_recognizer(profile);we=wn=ce=cn=0
     for _,audio,ref in samples:
-        pred=decode(rec,audio)
-        if not pred.strip():raise RuntimeError("Recognition returned no final text; calibration stopped")
+        pred = decode(rec, audio)
+        # No-final is a measured serving outcome, not a helper failure. Keep it
+        # in the denominator as an empty prediction so calibration and serving
+        # score the same final-segment contract.
         e,n=rate(ref,pred);we+=e;wn+=n
         e,n=rate(ref,pred,"char");ce+=e;cn+=n
     return {"wer":we/max(1,wn),"cer":ce/max(1,cn),"word_errors":we,"reference_words":wn,"char_errors":ce,"reference_chars":cn}
@@ -105,23 +112,29 @@ def main():
         rows=read_dataset(a.dataset);train,holdout=load_dataset(a.dataset)
         candidate=validate_profile(json.loads(a.proposal.read_text(encoding="utf-8")))
         baseline=load_profile();baseline_hash=profile_sha256(baseline)
-        personal=to_soda_profile(load_vocabulary())
+        vocabulary = load_vocabulary()
         personal_hash=vocabulary_fingerprint()
+        effective_personal_hash=profile_sha256(build_effective_profile(vocabulary))
         manifest_hash=file_sha(a.dataset);data_hash=dataset_identity(rows)
         candidate_hash=file_sha(a.proposal);artifacts=model_identity(make_recognizer())
         print("TRAIN_SIZE",len(train),"HOLDOUT_SIZE",len(holdout),flush=True)
-        train_scores={"active":score(train,merge_profile(baseline,personal))}
+        train_scores={"active":score(train,build_effective_profile(vocabulary, curated_profile=baseline))}
         for scale in BOOST_SCALES:
-            train_scores[str(scale)]=score(train,merge_profile(scaled_profile(candidate,scale),personal))
+            train_scores[str(scale)]=score(train,build_effective_profile(vocabulary, curated_profile=scaled_profile(candidate,scale)))
             print("TRAIN_SCORE",scale,train_scores[str(scale)]["wer"],flush=True)
         selected=min(train_scores,key=lambda k:(train_scores[k]["wer"],train_scores[k]["cer"],0 if k=="active" else float(k)))
-        before=score(holdout,merge_profile(baseline,personal))
-        after=score(holdout,merge_profile(scaled_profile(candidate,float(selected)),personal)) if selected!="active" else before
+        effective_before = build_effective_profile(vocabulary, curated_profile=baseline)
+        before=score(holdout,effective_before)
+        effective_after = (build_effective_profile(
+            vocabulary, curated_profile=scaled_profile(candidate, float(selected)))
+            if selected != "active" else effective_before)
+        after=score(holdout,effective_after) if selected!="active" else before
+        effective_profile_hash=profile_sha256(effective_after)
         passed=selected!="active" and after["wer"]<before["wer"] and after["cer"]<=before["cer"]
         if (file_sha(a.dataset)!=manifest_hash or file_sha(a.proposal)!=candidate_hash or
                 profile_sha256(load_profile())!=baseline_hash or vocabulary_fingerprint()!=personal_hash):
             raise RuntimeError("Dataset, candidate or active profile changed during calibration; rerun")
-        report={"schema_version":2,"status":"completed","language":"vi-VN","created_at":datetime.now(timezone.utc).isoformat(),"train_samples":len(train),"holdout_samples":len(holdout),"split_rule":"PCM SHA256 first8 hex modulo5; zero=holdout","selected_scale":float(selected) if selected!="active" else 0,"train_metrics":train_scores,"holdout_baseline":before,"holdout_candidate":after,"passed":passed,"method":"context_bias_calibration_not_Google_weight_training","candidate_sha256":candidate_hash,"active_profile_sha256":baseline_hash,"personal_vocabulary_sha256":personal_hash,"dataset_path":str(a.dataset.resolve()),"dataset_sha256":data_hash,"manifest_sha256":manifest_hash,"engine_artifacts":artifacts,"evaluation_pace":EVALUATION_PACE}
+        report={"schema_version":2,"status":"completed","language":"vi-VN","created_at":datetime.now(timezone.utc).isoformat(),"train_samples":len(train),"holdout_samples":len(holdout),"split_rule":"PCM SHA256 first8 hex modulo5; zero=holdout","selected_scale":float(selected) if selected!="active" else 0,"train_metrics":train_scores,"holdout_baseline":before,"holdout_candidate":after,"passed":passed,"method":"context_bias_calibration_not_Google_weight_training","candidate_sha256":candidate_hash,"active_profile_sha256":baseline_hash,"personal_vocabulary_sha256":personal_hash,"effective_personal_profile_sha256":effective_personal_hash,"effective_profile_sha256":effective_profile_hash,"dataset_path":str(a.dataset.resolve()),"dataset_sha256":data_hash,"manifest_sha256":manifest_hash,"engine_artifacts":artifacts,"evaluation_pace":EVALUATION_PACE}
         write_atomic(a.report,report)
         print("GATE","PASS" if passed else "FAIL","report",str(a.report),flush=True)
         if not passed:raise SystemExit(2)

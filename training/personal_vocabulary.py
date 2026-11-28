@@ -8,28 +8,53 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import unicodedata
 from pathlib import Path
 
-from training.context_profile import DATA, MAX_TERMS, validate_profile
+from training.context_profile import DATA, MAX_TERMS, profile_phrase_safety_error, validate_profile
 from training.storage import atomic_bytes
 
-VOCAB_PATH = DATA / "user_vocabulary.json"
+VOCAB_PATH = Path(os.environ.get("STT_VOCABULARY_PATH", str(DATA / "user_vocabulary.json")))
 SODA_CONTEXT_LIMIT = 40
 DEFAULT = {"schema_version": 1, "language": "vi-VN",
            "phrases": ["CDPA", "G8", "G6"], "replacements": []}
 REJECT = re.compile(r"(?i)(https?://|[/\\]|@|\b(?:sk-|ghp_|token|password|secret|api[_ -]?key)\b)")
 
 
+def _storage_term_safety_error(value: str) -> str | None:
+    """Validate privacy/security hazards without applying native SODA rules."""
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return "invalid unicode"
+    if any(unicodedata.category(ch).startswith("C") for ch in value):
+        return "control character"
+    if value != value.strip() or REJECT.search(value):
+        return "unsafe vocabulary format"
+    return None
+
+
 def _valid_term(value: str, *, max_length: int = 75) -> str:
     if not isinstance(value, str):
         raise ValueError("Vocabulary entries must be strings")
-    if not 2 <= len(value) <= max_length or value.strip() != value:
+    if not 2 <= len(value) <= max_length:
         raise ValueError("Phrases must be 2-75 characters without surrounding whitespace")
-    if REJECT.search(value) or any(unicodedata.category(ch).startswith("C") for ch in value):
+    if _storage_term_safety_error(value) is not None:
         raise ValueError("Paths, URLs, tokens, and control characters are not allowed")
     return value
+
+
+def _valid_correction_value(value: str) -> str:
+    """Validate stored correction output, not the stricter native profile input.
+
+    A correction is local text storage.  Native profile safety is deliberately
+    applied only by ``to_soda_profile`` when phrases enter the protobuf-backed
+    SODA context; otherwise a valid correction such as ``S20`` can make the
+    entire vocabulary unloadable.
+    """
+    return _valid_term(value)
 
 
 def validate_vocabulary(raw: dict) -> dict:
@@ -51,7 +76,10 @@ def validate_vocabulary(raw: dict) -> dict:
     for entry in rules:
         if not isinstance(entry, dict):
             raise ValueError("Each correction rule must contain heard and write")
-        heard, write = _valid_term(entry.get("heard")), _valid_term(entry.get("write"))
+        # Heard patterns may be technical storage text; replacement output is
+        # stricter because it is actively written into delivered user text.
+        heard = _valid_term(entry.get("heard"))
+        write = _valid_correction_value(entry.get("write"))
         if heard.casefold() in seen:
             raise ValueError("Duplicate correction source")
         seen.add(heard.casefold())
@@ -76,13 +104,29 @@ def save_vocabulary(raw: dict, path: Path = VOCAB_PATH) -> None:
     atomic_bytes(path, (json.dumps(clean, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
+def build_effective_profile(vocabulary: dict, curated_profile: dict | None = None) -> dict | None:
+    """Build the one capped, validator-safe profile used everywhere."""
+    vocab = validate_vocabulary(vocabulary)
+    from vi_enhance.dynamic_bias import build_smart_bias_profile
+    return build_smart_bias_profile(
+        personal_phrases=vocab["phrases"],
+        curated_profile=curated_profile,
+        limit=SODA_CONTEXT_LIMIT,
+    )
+
+
 def to_soda_profile(vocabulary: dict) -> dict | None:
+    """Return the effective native profile, filtering only at this boundary.
+
+    Storage validation intentionally accepts digit-heavy technical terms such as
+    ``S20`` and ``Qwen3.5``.  Native protobuf/profile validation is stricter,
+    so calibration must use the same safe candidate boundary as serving rather
+    than making one stored phrase invalidate an otherwise valid vocabulary.
+    """
     vocab = validate_vocabulary(vocabulary)
     if not vocab["phrases"]:
         return None
-    return validate_profile({"schema_version": 1, "language": "vi-VN",
-                             "terms": [{"phrase": term, "boost": 1.0}
-                                       for term in vocab["phrases"][:SODA_CONTEXT_LIMIT]]})
+    return build_effective_profile(vocab)
 
 
 def merge_profile(curated: dict | None, personal: dict | None) -> dict | None:
